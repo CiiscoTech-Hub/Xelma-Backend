@@ -17,6 +17,7 @@ import {
 import config from "../config";
 import { getMockBetHistory } from "../data/mockData";
 import { sendSuccess, sendError } from "../utils/response";
+import { computeXp, computeRankTitle } from "../utils/xp.util";
 
 const router = Router();
 

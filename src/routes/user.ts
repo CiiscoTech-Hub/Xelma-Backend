@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { validateStellarAddressParam } from '../utils/stellar-address.util';
 import hackathonService from '../services/hackathon.service';
 import sorobanService from '../services/soroban.service';
+import { computeXp, computeRankTitle } from '../utils/xp.util';
 import logger from '../utils/logger';
 import { serializeMoney } from '../utils/decimal.util';
 import { serializeUserBalance } from '../serializers/monetary.serializer';
