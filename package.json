@@ -24,6 +24,7 @@
     "docs:openapi": "node dist/scripts/generate-openapi.js",
     "docs:verify": "node scripts/verify-openapi-sync.js",
     "check:contract": "node scripts/verify-openapi-sync.js",
+    "check:bindings": "node scripts/verify-bindings.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",

@@ -1968,6 +1968,18 @@ The `RateLimit-*` and `Retry-After` response headers are also set (`standardHead
 
 ---
 
+## Upgrading Bindings
+
+The vendored `@tevalabs/xelma-bindings` package is pinned to a specific commit SHA and expected `Client` surface to catch ABI skew before a server serves bets.
+
+**To bump the bindings:**
+1. Upgrade the bindings via `npm install` or pulling upstream changes if vendored.
+2. Update the `"expectedCommitSha"` in `.bindings-metadata.json` with the new upstream commit hash.
+3. If new methods were added to the `Client` surface and used by the backend, add their snake_case names to the `"requiredExports"` array in `.bindings-metadata.json`.
+4. Run `npm run ci` to verify the new bindings match the expected metadata and CI passes.
+
+---
+
 ## Related Repositories
 
 - **Smart Contract**: [TevaLabs/Xelma-Blockchain](https://github.com/TevaLabs/Xelma-Blockchain)

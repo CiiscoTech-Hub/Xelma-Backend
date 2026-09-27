@@ -29,18 +29,34 @@ export function getVendorBindingsRoot(cwd: string = process.cwd()): string {
  * whether a missing vendor is fatal (Soroban-required deployments) or just
  * worth logging (API-only deployments).
  */
-export function validateVendoredBindings(
+export async function validateVendoredBindings(
   cwd: string = process.cwd(),
-): BindingsValidationResult {
+): Promise<BindingsValidationResult> {
   const vendorPath = getVendorBindingsRoot(cwd);
   const esmEntryPath = path.join(vendorPath, "dist", "index.js");
   const cjsEntryPath = path.join(vendorPath, "dist", "cjs", "index.js");
   const packageJsonPath = path.join(vendorPath, "package.json");
   const commitShaPath = path.join(vendorPath, ".commit-sha");
+  const metadataPath = path.join(cwd, ".bindings-metadata.json");
 
   const errors: string[] = [];
   let packageName: string | null = null;
   let commitSha: string | null = null;
+
+  let expectedCommitSha: string | null = null;
+  let requiredExports: string[] = [];
+
+  if (fs.existsSync(metadataPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+      expectedCommitSha = meta.expectedCommitSha || null;
+      requiredExports = Array.isArray(meta.requiredExports) ? meta.requiredExports : [];
+    } catch (e) {
+      errors.push(`metadata file is not valid JSON: ${(e as Error).message}`);
+    }
+  } else {
+    errors.push(`metadata file missing: ${metadataPath}`);
+  }
 
   if (!fs.existsSync(vendorPath)) {
     errors.push(
@@ -74,6 +90,35 @@ export function validateVendoredBindings(
         commitSha = fs.readFileSync(commitShaPath, "utf8").trim() || null;
       } catch {
         commitSha = null;
+      }
+    }
+    
+    if (commitSha && expectedCommitSha && commitSha !== expectedCommitSha) {
+      errors.push(`bindings commit SHA mismatch: expected ${expectedCommitSha}, got ${commitSha}`);
+    }
+
+    if (errors.length === 0 && requiredExports.length > 0) {
+      try {
+        // Use relative path to avoid node_modules resolution issues
+        const { Client } = await import(esmEntryPath);
+        if (!Client) {
+          errors.push("vendor package does not export a Client class");
+        } else {
+          // Initialize dummy client to inspect surface
+          const clientInstance = new Client({
+            contractId: "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            networkPassphrase: "Test",
+            rpcUrl: "http://localhost:8000"
+          });
+          
+          for (const reqExport of requiredExports) {
+            if (typeof clientInstance[reqExport] !== "function") {
+              errors.push(`Client surface is missing required method: ${reqExport}`);
+            }
+          }
+        }
+      } catch (e) {
+        errors.push(`Failed to inspect bindings Client: ${(e as Error).message}`);
       }
     }
   }

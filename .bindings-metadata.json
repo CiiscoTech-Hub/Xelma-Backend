@@ -1,0 +1,15 @@
+{
+  "expectedCommitSha": "9258dbbd1b8a6d4fdefc3453594d5c31ea736fb0",
+  "requiredExports": [
+    "balance",
+    "claim_winnings",
+    "create_round",
+    "get_active_round",
+    "get_pending_winnings",
+    "get_user_stats",
+    "mint_initial",
+    "place_bet",
+    "place_precision_prediction",
+    "resolve_round"
+  ]
+}

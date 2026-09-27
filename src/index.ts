@@ -52,8 +52,8 @@ const validateEnv = (): void => {
  * "Cannot find module" deep inside the Soroban service later. Only logs —
  * never throws — because API-only deployments may run without Soroban.
  */
-function logBindingsValidation(): void {
-   const result = validateVendoredBindings();
+async function logBindingsValidation(): Promise<void> {
+   const result = await validateVendoredBindings();
    if (result.ok) {
       logger.info('Vendored bindings OK', {
          vendorPath: result.info.vendorPath,
@@ -61,14 +61,15 @@ function logBindingsValidation(): void {
          commitSha: result.info.commitSha,
       });
    } else {
-      logger.warn(
-         'Vendored bindings validation failed; Soroban integration may fail at runtime',
+      logger.error(
+         'Vendored bindings validation failed; startup aborted',
          {
             vendorPath: result.info.vendorPath,
             errors: result.errors,
             commitSha: result.info.commitSha,
          }
       );
+      process.exit(1);
    }
 }
 
@@ -77,26 +78,29 @@ assertPreflightOrExit();
 
 // Execute validation immediately
 validateEnv();
-logBindingsValidation();
-logger.info(`Active DATA_MODE=${config.app.dataMode}`);
-logger.info(`ROUNDS_MOCK_MODE=${config.app.roundsMockMode}`);
-logger.info(
-  'Soroban configuration resolved',
-  formatResolvedSorobanConfigForLog(resolveSorobanEnvVars(), {
-    rpcUrl: config.soroban.rpcUrl,
-    network: config.soroban.network,
-  }),
-);
 
-const betStubMode = process.env.BET_STUB_MODE === "true";
-logger.info(`Bet mode: ${betStubMode ? "STUB (no on-chain calls)" : "ON-CHAIN (Soroban)"}`, {
-  BET_STUB_MODE: betStubMode,
-});
-logger.info(
-  `Soroban money-path policy: ${config.soroban.failClosed ? "FAIL-CLOSED (abort on chain failure)" : "FAIL-OPEN (DB-only fallback allowed)"}`,
-  { SOROBAN_FAIL_CLOSED: config.soroban.failClosed },
-);
-logger.info('Runtime modes documented at docs/runtime-modes.md');
+(async () => {
+  await logBindingsValidation();
+
+  logger.info(`Active DATA_MODE=${config.app.dataMode}`);
+  logger.info(`ROUNDS_MOCK_MODE=${config.app.roundsMockMode}`);
+  logger.info(
+    'Soroban configuration resolved',
+    formatResolvedSorobanConfigForLog(resolveSorobanEnvVars(), {
+      rpcUrl: config.soroban.rpcUrl,
+      network: config.soroban.network,
+    }),
+  );
+
+  const betStubMode = process.env.BET_STUB_MODE === "true";
+  logger.info(`Bet mode: ${betStubMode ? "STUB (no on-chain calls)" : "ON-CHAIN (Soroban)"}`, {
+    BET_STUB_MODE: betStubMode,
+  });
+  logger.info(
+    `Soroban money-path policy: ${config.soroban.failClosed ? "FAIL-CLOSED (abort on chain failure)" : "FAIL-OPEN (DB-only fallback allowed)"}`,
+    { SOROBAN_FAIL_CLOSED: config.soroban.failClosed },
+  );
+  logger.info('Runtime modes documented at docs/runtime-modes.md');
 
 /**
  * Create and configure the Express app without starting any background
