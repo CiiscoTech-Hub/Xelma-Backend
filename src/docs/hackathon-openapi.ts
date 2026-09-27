@@ -1,6 +1,10 @@
 import path from 'path';
 import swaggerJSDoc from 'swagger-jsdoc';
 import { sharedComponents } from './shared-components';
+import {
+  CHALLENGE_EXAMPLE_PUBLIC_KEY,
+  CONNECT_EXAMPLE_PUBLIC_KEY,
+} from './strkey-fixtures';
 
 const PORT = process.env.PORT || 3001;
 const API_BASE_URL = process.env.API_BASE_URL || `http://localhost:${PORT}`;
@@ -30,8 +34,10 @@ export const hackathonSwaggerSpec = swaggerJSDoc({
           properties: {
             walletAddress: {
               type: 'string',
-              description: 'Stellar wallet public key (G...)',
-              example: 'GBRPYHIL2C2V3F5YQZ4H6J7K8L9M0N1O2P3Q4R5S6T7U8V9W0X1Y2Z3A4B',
+              description:
+                'Stellar wallet public key (G...). Must decode as a valid Ed25519 StrKey.',
+              // Cryptographically valid fixture (see src/docs/strkey-fixtures.ts).
+              example: CHALLENGE_EXAMPLE_PUBLIC_KEY,
             },
           },
           required: ['walletAddress'],
@@ -39,8 +45,16 @@ export const hackathonSwaggerSpec = swaggerJSDoc({
         },
         AuthChallengeResponse: {
           type: 'object',
+          description:
+            'SEP-10-style challenge (same as production). Challenge string includes Domain/Home Domain for wallet UX. Legacy xelma_auth_* still verifies.',
           properties: {
-            challenge: { type: 'string', example: 'random-challenge-string' },
+            challenge: {
+              type: 'string',
+              example:
+                'Xelma Authentication\nDomain: xelma.io\nHome Domain: xelma.io\nNonce: ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12\nIssued At: 2026-09-01T00:00:00.000Z\nVersion: 1\nTimestamp: 1725148800000',
+            },
+            domain: { type: 'string', example: 'xelma.io' },
+            homeDomain: { type: 'string', example: 'xelma.io' },
             expiresAt: { type: 'string', format: 'date-time' },
           },
           required: ['challenge', 'expiresAt'],
@@ -49,7 +63,13 @@ export const hackathonSwaggerSpec = swaggerJSDoc({
         AuthConnectRequest: {
           type: 'object',
           properties: {
-            walletAddress: { type: 'string', description: 'Stellar wallet public key (G...)' },
+            // Independent valid StrKey from the challenge example (see
+            // src/docs/strkey-fixtures.ts).
+            walletAddress: {
+              type: 'string',
+              description: 'Stellar wallet public key (G...)',
+              example: CONNECT_EXAMPLE_PUBLIC_KEY,
+            },
             challenge: { type: 'string', description: 'Challenge previously returned from /challenge' },
             signature: { type: 'string', description: 'Signature over the challenge' },
           },
@@ -103,13 +123,20 @@ export const hackathonSwaggerSpec = swaggerJSDoc({
           description:
             'Multi-asset ticker payload inside the success envelope from GET /api/prices. The hackathon app does not expose GET /api/price (that path is production-only XLM oracle).',
           properties: {
-            BTC: { type: 'number', example: 67420.12 },
-            ETH: { type: 'number', example: 3241.55 },
-            XLM: { type: 'number', example: 0.2891 },
-            stale: { type: 'boolean', example: false },
-            lastUpdatedAt: { type: 'string', format: 'date-time', nullable: true },
+            success: { type: 'boolean', example: true },
+            data: {
+              type: 'object',
+              properties: {
+                BTC: { type: 'number', example: 67420.12 },
+                ETH: { type: 'number', example: 3241.55 },
+                XLM: { type: 'number', example: 0.2891 },
+                stale: { type: 'boolean', example: false },
+                lastUpdatedAt: { type: 'string', format: 'date-time', nullable: true },
+              },
+              required: ['BTC', 'ETH', 'XLM', 'stale', 'lastUpdatedAt'],
+            },
           },
-          required: ['BTC', 'ETH', 'XLM', 'stale', 'lastUpdatedAt'],
+          required: ['success', 'data'],
         },
         HealthResponse: {
           type: 'object',
@@ -228,7 +255,7 @@ export const hackathonSwaggerSpec = swaggerJSDoc({
     path.join(process.cwd(), 'src/routes/health.ts'),
     path.join(process.cwd(), 'src/routes/index.ts'),
     path.join(process.cwd(), 'src/routes/stats.ts'),
-    path.join(process.cwd(), 'src/routes/rounds.ts'),
+    path.join(process.cwd(), 'src/routes/rounds.routes.ts'),
     path.join(process.cwd(), 'src/routes/leaderboard.ts'),
     path.join(process.cwd(), 'src/routes/tournaments.routes.ts'),
     path.join(process.cwd(), 'src/routes/user.ts'),

@@ -1,11 +1,12 @@
-import { GameMode } from "@prisma/client";
+import { GameMode, Round } from "@prisma/client";
 import sorobanService from "./soroban.service";
 import websocketService from "./websocket.service";
 import notificationService from "./notification.service";
 import logger from "../utils/logger";
 import { prisma } from "../lib/prisma";
 import { ConflictError, ValidationError, ErrorCode } from "../utils/errors";
-import { RoundLifecycleOutcome } from "../types/round.types";
+import { RoundLifecycleOutcome, RoundStatus } from "../types/round.types";
+import roundLifecycleService from "./round-lifecycle.service";
 import { Decimal } from "@prisma/client/runtime/library";
 import { toDecimal, toNumber } from "../utils/decimal.util";
 import { roundsStartedTotal } from "../metrics/application.metrics";
@@ -17,6 +18,7 @@ import {
   mapSorobanActiveRound,
 } from "../utils/soroban-round.mapper";
 import { getMockRounds } from "../data/mockData";
+import type { RoundListItem } from "../repositories/interfaces";
 
 interface LegendsPriceRange {
   min: number;
@@ -91,7 +93,11 @@ export class RoundService {
       const round = await prisma.round.create({
         data: {
           mode: gameMode,
-          status: "ACTIVE",
+          // Rounds are instantiated directly in ACTIVE (open) state: creation
+          // bootstraps the machine rather than transitioning an existing row.
+          // Every *transition* out of ACTIVE routes through the lifecycle
+          // state machine (round-lifecycle.service).
+          status: "ACTIVE" as RoundStatus,
           startTime,
           endTime,
           startPrice: startPriceDecimal,
@@ -182,7 +188,7 @@ export class RoundService {
    */
   async getRoundsForApi(): Promise<{
     source: ActiveRoundSource;
-    rounds: any[];
+    rounds: RoundListItem[];
   }> {
     if (config.app.roundsMockMode) {
       return { source: "mock", rounds: await this.getMockRoundsForApi() };
@@ -227,9 +233,11 @@ export class RoundService {
    * origin of an individual round the same way they can for the soroban and
    * database tiers.
    */
-  private async getMockRoundsForApi(): Promise<any[]> {
+  private async getMockRoundsForApi(): Promise<RoundListItem[]> {
     const rounds = await getMockRounds();
-    return rounds.map((round) => mapMockActiveRound(round as Record<string, unknown>));
+    return rounds.map((round) =>
+      mapMockActiveRound(round as Record<string, unknown>),
+    );
   }
 
   /**
@@ -238,7 +246,7 @@ export class RoundService {
    */
   async getActiveRoundsWithFallback(): Promise<{
     source: ActiveRoundSource;
-    rounds: any[];
+    rounds: RoundListItem[];
   }> {
     return this.getRoundsForApi();
   }
@@ -246,7 +254,7 @@ export class RoundService {
   /**
    * Gets all active rounds
    */
-  async getActiveRounds(): Promise<any[]> {
+  async getActiveRounds(): Promise<Round[]> {
     try {
       const rounds = await prisma.round.findMany({
         where: {
@@ -265,35 +273,18 @@ export class RoundService {
   }
 
   /**
-   * Locks a round (no more predictions allowed)
+   * Locks a round (no more predictions allowed).
+   *
+   * Delegates the actual status write to the lifecycle state machine so the
+   * illegal-transition guard is enforced in one place (round-lifecycle.service).
+   * Returns an outcome for the scheduler callers while still throwing on truly
+   * illegal hops (e.g. locking a round that was never ACTIVE).
    */
   async lockRound(roundId: string): Promise<RoundLifecycleOutcome> {
     try {
-      const round = await prisma.round.findUnique({
-        where: { id: roundId },
-        select: { status: true },
-      });
-
-      if (!round) {
-        return RoundLifecycleOutcome.NO_OP;
-      }
-
-      if (round.status === "LOCKED") {
-        return RoundLifecycleOutcome.ALREADY_LOCKED;
-      }
-
-      if (round.status === "RESOLVED" || round.status === "CANCELLED") {
-        return RoundLifecycleOutcome.NO_OP;
-      }
-
-      const updatedRound = await prisma.round.update({
-        where: { id: roundId },
-        data: { status: "LOCKED" },
-      });
-
-      websocketService.emitRoundUpdate(updatedRound);
-      logger.info(`Round locked: ${roundId}`);
-      return RoundLifecycleOutcome.UPDATED;
+      // Reuse the state-machine's outcome mapping (NOW_OP for missing/final
+      // rounds, ALREADY_LOCKED for idempotent locks, UPDATED otherwise).
+      return await roundLifecycleService.lockRound(roundId);
     } catch (error) {
       logger.error("Failed to lock round:", error);
       throw error;
@@ -421,7 +412,9 @@ export class RoundService {
     }
   }
 
-  private generateDefaultLegendsRanges(startPrice: number): LegendsPriceRange[] {
+  private generateDefaultLegendsRanges(
+    startPrice: number,
+  ): LegendsPriceRange[] {
     const rangeWidth = startPrice * 0.05;
     return [
       { min: startPrice - rangeWidth * 2, max: startPrice - rangeWidth },
@@ -457,9 +450,7 @@ export class RoundService {
       if (i > 0) {
         const prev = sorted[i - 1];
         if (range.min < prev.max) {
-          throw new ValidationError(
-            "LEGENDS price ranges must not overlap",
-          );
+          throw new ValidationError("LEGENDS price ranges must not overlap");
         }
       }
     }

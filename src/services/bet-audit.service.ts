@@ -41,8 +41,8 @@
 
 import logger from "../utils/logger";
 import { prisma } from "../lib/prisma";
-import { GameMode } from "@prisma/client";
-import type { BetStatus } from "../data/bet-store";
+import { GameMode, BetStatus } from "@prisma/client";
+import { getRequestId } from "../utils/requestContext";
 
 export type BetAuditEventName =
   | "BET_ACCEPTED"
@@ -63,6 +63,9 @@ export interface BetAuditEvent {
   /** Reconciliation status of the bet at the time the event was emitted. */
   status?: BetStatus;
   txHash?: string;
+  requestId?: string;
+  /** Correlation id linking requestId ↔ txHash for distributed tracing */
+  correlationId?: string;
   failureReason?: string;
   createdAt: string;
 }
@@ -76,6 +79,8 @@ export interface BetAuditParams {
   result: string;
   status?: BetStatus;
   txHash?: string;
+  requestId?: string;
+  correlationId?: string;
   failureReason?: string;
 }
 
@@ -84,6 +89,8 @@ export interface ClaimAuditParams {
   amount: number;
   result: string;
   txHash?: string;
+  requestId?: string;
+  correlationId?: string;
 }
 
 class BetAuditService {
@@ -143,6 +150,8 @@ class BetAuditService {
     message: string,
     params: BetAuditParams,
   ): BetAuditEvent {
+    const requestId = params.requestId ?? getRequestId();
+    const correlationId = params.correlationId ?? (requestId && params.txHash ? `${requestId}:${params.txHash}` : requestId ?? params.txHash);
     const event: BetAuditEvent = {
       event: eventName,
       roundId: undefined,
@@ -154,13 +163,15 @@ class BetAuditService {
       result: params.result,
       status: params.status,
       txHash: params.txHash,
+      requestId,
+      correlationId,
       failureReason: params.failureReason,
       createdAt: new Date().toISOString(),
     };
 
     this.events.push(event);
 
-    logger.info(message, { audit: true, ...event });
+    logger.info(message, { audit: true, requestId, correlationId, ...event });
 
     void this.enrichAndPersist(event, params);
 
@@ -172,18 +183,22 @@ class BetAuditService {
    * Same storage modes as BET_ACCEPTED; never emitted for failed claims.
    */
   emitClaimAccepted(params: ClaimAuditParams): BetAuditEvent {
+    const requestId = params.requestId ?? getRequestId();
+    const correlationId = params.correlationId ?? (requestId && params.txHash ? `${requestId}:${params.txHash}` : requestId ?? params.txHash);
     const event: BetAuditEvent = {
       event: "CLAIM_ACCEPTED",
       address: params.address,
       amount: params.amount,
       result: params.result,
       txHash: params.txHash,
+      requestId,
+      correlationId,
       createdAt: new Date().toISOString(),
     };
 
     this.events.push(event);
 
-    logger.info("Claim accepted", { audit: true, ...event });
+    logger.info("Claim accepted", { audit: true, requestId, correlationId, ...event });
 
     if (this.storageMode === "database") {
       void this.persistClaimToDatabase(event).catch((error) => {
@@ -263,6 +278,8 @@ class BetAuditService {
           result: event.result,
           status: event.status,
           txHash: event.txHash,
+          requestId: event.requestId,
+          correlationId: event.correlationId,
           failureReason: event.failureReason,
         } as any,
         timestamp: new Date(event.createdAt),
@@ -284,6 +301,8 @@ class BetAuditService {
           amount: event.amount,
           result: event.result,
           txHash: event.txHash,
+          requestId: event.requestId,
+          correlationId: event.correlationId,
         } as any,
         timestamp: new Date(event.createdAt),
       },
