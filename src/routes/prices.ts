@@ -1,14 +1,24 @@
 import { Router, Request, Response } from 'express';
 import { getPrices } from '../services/priceService';
+import { sendSuccess, sendError } from '../utils/response';
 import priceOracle from '../services/oracle';
+import { setPublicCache } from '../utils/http-cache';
 
 const router = Router();
 
 /**
- * The legacy single-asset XLM oracle endpoint lives on its own router so the
- * app factory can gate it behind the `legacyPriceEndpoint` flag: the hackathon
- * app serves `GET /api/prices` but must not expose `GET /api/price`.
- * See src/app-factory.ts and docs/runtime-modes.md.
+ * @openapi
+ * /api/prices:
+ *   get:
+ *     summary: Live BTC, ETH, and XLM prices
+ *     description: |
+ *       Fetches USD prices from CoinGecko with a 30-second in-memory cache.
+ *       When CoinGecko is temporarily unavailable, returns the last cached
+ *       values with `stale: true`.
+ *       The legacy single-asset XLM oracle endpoint lives on its own router so the
+ *       app factory can gate it behind the `legacyPriceEndpoint` flag: the hackathon
+ *       app serves `GET /api/prices` but must not expose `GET /api/price`.
+ *       See src/app-factory.ts and docs/runtime-modes.md.
  */
 export const legacyXlmPriceRouter = Router();
 
@@ -38,17 +48,17 @@ export const legacyXlmPriceRouter = Router();
  *       - prices
  *     responses:
  *       200:
- *         description: Current multi-asset market prices
+ *         description: Current market prices
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/MultiAssetPriceResponse'
- *             example:
- *               BTC: 67420.12
- *               ETH: 3241.55
- *               XLM: 0.2891
- *               stale: false
- *               lastUpdatedAt: '2026-07-29T12:00:00.000Z'
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   $ref: '#/components/schemas/PriceResponse'
  *       503:
  *         description: Price service unavailable (no cache and upstream failed)
  *         content:
@@ -56,6 +66,9 @@ export const legacyXlmPriceRouter = Router();
  *             schema:
  *               type: object
  *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
  *                 error:
  *                   type: string
  *                 message:
@@ -72,18 +85,17 @@ export const legacyXlmPriceRouter = Router();
 router.get('/prices', async (_req: Request, res: Response) => {
   try {
     const snapshot = await getPrices();
-    res.json(snapshot);
+    setPublicCache(res, 30);
+    sendSuccess(res, snapshot);
   } catch (error) {
-    res.status(503).json({
-      error: 'Price service unavailable',
-      message:
-        error instanceof Error
-          ? error.message
-          : 'Unable to fetch prices and no cached data is available',
-      stale: true,
-      lastUpdatedAt: null,
-      source: null,
-    });
+    setPublicCache(res, 30);
+    sendError(
+      res,
+      error instanceof Error
+        ? error.message
+        : 'Unable to fetch prices and no cached data is available',
+      503
+    );
   }
 });
 
@@ -133,6 +145,7 @@ router.get('/prices', async (_req: Request, res: Response) => {
  *               timestamp: '2026-07-29T12:00:05.000Z'
  */
 legacyXlmPriceRouter.get('/price', (_req: Request, res: Response) => {
+  setPublicCache(res, 30);
   const price = priceOracle.getPriceString();
   const lastUpdatedAt = priceOracle.getLastUpdatedAt();
   res.json({

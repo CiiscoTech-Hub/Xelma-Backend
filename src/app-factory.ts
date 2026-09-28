@@ -39,6 +39,7 @@ import errorsRoutes from './routes/errors.routes';
 import corsDiagnosticsRoutes from './routes/admin-cors-diagnostics.routes';
 import deadLetterRoutes from './routes/admin-dead-letter.routes';
 import betAuditRoutes from './routes/admin-bet-audit.routes';
+import runtimeFlagsRoutes from './routes/admin-runtime-flags.routes';
 import healthRoutes from './routes/health';
 import statsRoutes from './routes/stats';
 import indexRoutes from './routes/index';
@@ -67,6 +68,7 @@ import { swaggerSpec } from './docs/openapi';
 import { hackathonSwaggerSpec } from './docs/hackathon-openapi';
 import config from './config';
 import logger from './utils/logger';
+import { noStoreHeaders } from './utils/http-cache';
 
 export type AppMode = 'full' | 'hackathon';
 
@@ -88,6 +90,8 @@ export interface AppFeatures {
   errorCatalog: boolean;
   /** Admin surfaces: metrics, CORS diagnostics, dead-letter queue, bet audit. */
   adminRoutes: boolean;
+  /** CORS diagnostics only — mounted independently behind ENABLE_CORS_DIAGNOSTICS. */
+  corsDiagnostics: boolean;
   /** Mirror every `/api/*` route under `/api/v1/*`. */
   versionedAlias: boolean;
   /** Emit Deprecation/Sunset headers on unversioned `/api/*` paths. */
@@ -131,6 +135,7 @@ const FULL_FEATURES: AppFeatures = {
   education: true,
   errorCatalog: true,
   adminRoutes: true,
+  corsDiagnostics: true,
   versionedAlias: true,
   deprecationHeaders: true,
   globalApiRateLimit: false,
@@ -154,6 +159,7 @@ const HACKATHON_FEATURES: AppFeatures = {
   education: false,
   errorCatalog: false,
   adminRoutes: false,
+  corsDiagnostics: Boolean(process.env.ENABLE_CORS_DIAGNOSTICS),
   versionedAlias: false,
   deprecationHeaders: false,
   globalApiRateLimit: true,
@@ -187,9 +193,10 @@ function mountBaseMiddleware(app: Application, mode: AppMode): void {
   // Permissions-Policy that helmet's defaults do not set (Issue #414/#480).
   app.use(securityHeadersMiddleware);
 
-  app.use(express.json());
+  const jsonLimit = process.env.JSON_BODY_LIMIT || '16kb';
+  app.use(express.json({ limit: jsonLimit }));
   if (mode === 'full') {
-    app.use(express.urlencoded({ extended: true }));
+    app.use(express.urlencoded({ extended: true, limit: jsonLimit }));
   }
 
   app.use(
@@ -231,15 +238,15 @@ function mountApiRoutes(
   features: AppFeatures,
 ): void {
   if (features.auth) {
-    target.use('/auth', authRoutes);
+    target.use('/auth', noStoreHeaders, authRoutes);
   }
 
   target.use('/user', userRoutes);
   target.use('/rounds', roundsRoutes);
-  target.use('/bets', betsRoutes);
+  target.use('/bets', noStoreHeaders, betsRoutes);
 
   if (features.predictions) {
-    target.use('/predictions', predictionsRoutes);
+    target.use('/predictions', noStoreHeaders, predictionsRoutes);
   }
   if (features.education) {
     target.use('/education', educationRoutes);
@@ -266,6 +273,12 @@ function mountApiRoutes(
     target.use('/admin/cors-diagnostics', corsDiagnosticsRoutes);
     target.use('/admin/dead-letter', deadLetterRoutes);
     target.use('/admin/bet-audit', betAuditRoutes);
+    target.use('/admin/runtime-flags', runtimeFlagsRoutes);
+  } else if (features.corsDiagnostics) {
+    // In hackathon mode, mount CORS diagnostics independently when
+    // ENABLE_CORS_DIAGNOSTICS is set. Auth/admin checks are still enforced
+    // by the route's own requireAdmin middleware.
+    target.use('/admin/cors-diagnostics', corsDiagnosticsRoutes);
   }
 
   if (features.errorCatalog) {
@@ -277,6 +290,10 @@ function mountApiRoutes(
   // response shapes (raw snapshot vs. success envelope), so the router is
   // mode-specific like rounds and leaderboard above.
   target.use('/', mode === 'full' ? pricesRoutes : indexRoutes);
+
+  if (features.legacyPriceEndpoint) {
+    target.use('/', legacyXlmPriceRouter);
+  }
 }
 
 /**
@@ -322,13 +339,6 @@ export function createApp(options: CreateAppOptions = {}): Application {
     app.use('/api/v1', v1Router);
   }
 
-  const apiRouter = Router();
-  if (mode === 'hackathon') {
-    apiRouter.use('/', healthRoutes);
-  }
-  mountApiRoutes(apiRouter, mode, features);
-  app.use('/api', apiRouter);
-
   if (features.deprecationHeaders) {
     app.use('/api', (req: Request, res: Response, next: NextFunction) => {
       if (!req.path.startsWith('/v1')) {
@@ -339,6 +349,13 @@ export function createApp(options: CreateAppOptions = {}): Application {
       next();
     });
   }
+
+  const apiRouter = Router();
+  if (mode === 'hackathon') {
+    apiRouter.use('/', healthRoutes);
+  }
+  mountApiRoutes(apiRouter, mode, features);
+  app.use('/api', apiRouter);
 
   if (mode === 'full') {
     app.use('/metrics', metricsRoutes);
@@ -355,12 +372,6 @@ export function createApp(options: CreateAppOptions = {}): Application {
           status: 'OK',
         });
       });
-    }
-
-    if (features.legacyPriceEndpoint) {
-      // Owned by src/routes/prices.ts alongside /api/prices, so the two
-      // contracts stay documented in one file (#394).
-      app.use('/api', legacyXlmPriceRouter);
     }
   }
 

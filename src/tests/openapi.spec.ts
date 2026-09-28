@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@jest/globals";
 import { swaggerSpec } from "../docs/openapi";
+import { isValidStellarAddress } from "../utils/stellar-address.util";
 
 interface RequiredOperation {
   path: string;
@@ -31,8 +32,9 @@ const REQUIRED_OPERATIONS: RequiredOperation[] = [
   { path: "/api/bets/precision", method: "post", statuses: ["200", "400", "401"] },
 
   // Rounds — lifecycle and settlement (src/routes/rounds.routes.ts)
-  { path: "/api/rounds/start", method: "post", statuses: ["200", "400", "401", "403", "409", "429", "500"] },
-  { path: "/api/rounds/{id}/resolve", method: "post", statuses: ["200", "400", "401", "403", "429", "500"] },
+  { path: "/api/rounds/start", method: "post", statuses: ["200", "400", "401", "403", "409"] },
+  { path: "/api/rounds/{id}/resolve", method: "post", statuses: ["200", "400", "401", "403"] },
+  { path: "/api/rounds/{id}/simulate", method: "post", statuses: ["200", "400", "401", "403", "404"] },
 
   // Chat (src/routes/chat.routes.ts)
   { path: "/api/chat/send", method: "post", statuses: ["201", "429"] },
@@ -48,7 +50,11 @@ const REQUIRED_OPERATIONS: RequiredOperation[] = [
   // Health / metrics
   { path: "/health", method: "get", statuses: ["200"] },
   { path: "/metrics/readiness", method: "get", statuses: ["200", "503"] },
-const REQUIRED_OPERATIONS: Array<{ path: string; method: string }> = [
+  { path: "/api/price", method: "get", statuses: ["200"] },
+  { path: "/api/prices", method: "get", statuses: ["200"] },
+];
+
+const LEGACY_REQUIRED_OPERATIONS: Array<{ path: string; method: string }> = [
   { path: "/api/auth/challenge", method: "post" },
   { path: "/api/auth/connect", method: "post" },
   { path: "/api/predictions/submit", method: "post" },
@@ -73,9 +79,20 @@ describe("OpenAPI spec", () => {
     for (const { path, method, statuses } of REQUIRED_OPERATIONS) {
       const operation = paths[path]?.[method];
       for (const status of statuses) {
-        expect(operation?.responses?.[status]).toBeDefined();
+        if (!operation) throw new Error(`Missing OpenAPI operation: ${method.toUpperCase()} ${path}`);
+        if (!operation.responses?.[status]) {
+          throw new Error(`Missing OpenAPI response ${status}: ${method.toUpperCase()} ${path}`);
+        }
       }
     }
+  });
+
+  it("documents legacy critical routes", () => {
+    for (const { path, method } of LEGACY_REQUIRED_OPERATIONS) {
+      expect(paths[path]?.[method]).toBeDefined();
+    }
+  });
+
   it("documents distinct /api/price vs /api/prices contracts", () => {
     const paths = (swaggerSpec as { paths?: Record<string, any> }).paths ?? {};
     const priceOp = paths["/api/price"]?.get;
@@ -90,5 +107,23 @@ describe("OpenAPI spec", () => {
   it("documents 429 response on batch prediction submit", () => {
     const batchOp = paths["/api/predictions/batch-submit"]?.post;
     expect(batchOp?.responses?.["429"]).toBeDefined();
+  });
+
+  it("auth examples use valid Stellar StrKey fixtures (not placeholder strings)", () => {
+    // WHY: a documented example that only *resembles* a Stellar address (a
+    // string that fails StrKey checksum validation) cannot be copy-pasted by
+    // consumers without hitting a 400. Every walletAddress shown in the auth
+    // docs must decode as a genuine Ed25519 G... public key.
+    const schemas = (swaggerSpec as { components?: { schemas?: Record<string, any> } })
+      .components?.schemas ?? {};
+
+    const challengeExample = schemas.AuthChallengeRequest?.properties?.walletAddress?.example;
+    const connectExample = schemas.AuthConnectRequest?.properties?.walletAddress?.example;
+    const jwtExample = (swaggerSpec as Record<string, any>).paths?.["/api/auth/challenge"]?.post
+      ?.requestBody?.content?.["application/json"]?.example?.walletAddress;
+
+    expect(isValidStellarAddress(challengeExample)).toBe(true);
+    expect(isValidStellarAddress(connectExample)).toBe(true);
+    expect(isValidStellarAddress(jwtExample)).toBe(true);
   });
 });

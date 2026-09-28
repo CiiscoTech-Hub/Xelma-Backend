@@ -82,6 +82,7 @@ describe('Price endpoint contracts (/api/price vs /api/prices)', () => {
       expect(res.body).not.toHaveProperty('BTC');
       expect(res.body).not.toHaveProperty('ETH');
       expect(res.body.success).toBeUndefined();
+      expect(res.headers['cache-control']).toContain('public');
     });
 
     it('GET /api/prices returns the multi-asset ticker payload shape', async () => {
@@ -90,15 +91,20 @@ describe('Price endpoint contracts (/api/price vs /api/prices)', () => {
       expect(res.status).toBe(200);
       expect(res.body).toEqual(
         expect.objectContaining({
-          BTC: 67_420.12,
-          ETH: 3_241.55,
-          XLM: 0.2891,
-          stale: false,
+          success: true,
+          data: expect.objectContaining({
+            BTC: 67_420.12,
+            ETH: 3_241.55,
+            XLM: 0.2891,
+            stale: false,
+          }),
         }),
       );
       expect(res.body).not.toHaveProperty('asset');
       expect(res.body).not.toHaveProperty('price_usd');
-      expect(res.body.success).toBeUndefined();
+      expect(res.headers['cache-control']).toBe(
+        'public, max-age=30, s-maxage=30, stale-while-revalidate=30',
+      );
     });
 
     it('does not treat /api/price and /api/prices as interchangeable', async () => {
@@ -108,7 +114,7 @@ describe('Price endpoint contracts (/api/price vs /api/prices)', () => {
       ]);
 
       expect(oracle.body.asset).toBe('XLM');
-      expect(multi.body.BTC).toEqual(expect.any(Number));
+      expect(multi.body.data.BTC).toEqual(expect.any(Number));
       expect(Object.keys(oracle.body).sort()).not.toEqual(Object.keys(multi.body).sort());
     });
   });

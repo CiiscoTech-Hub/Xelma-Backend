@@ -1,5 +1,5 @@
 import { Keypair, Networks, Transaction } from "@stellar/stellar-sdk";
-import type { Client as XelmaClient, BetSide, OraclePayload, RoundMode, UserStats } from "@tevalabs/xelma-bindings";
+import type { Client as XelmaClient, BetSide, OraclePayload, RoundMode, UserStats, contract } from "@tevalabs/xelma-bindings";
 import config from "../config";
 import logger from "../utils/logger";
 import { toDecimal } from "../utils/decimal.util";
@@ -14,6 +14,7 @@ import {
   sorobanRpcCallsTotal,
   sorobanRpcDurationSeconds,
 } from "../metrics/application.metrics";
+import { getRequestId } from "../utils/requestContext";
 
 export interface SorobanHealth {
   initialized: boolean;
@@ -23,6 +24,63 @@ export interface SorobanHealth {
   hasAdminKey: boolean;
   hasOracleKey: boolean;
   failClosed: boolean;
+}
+
+export interface TransactionStatus {
+  confirmed: boolean;
+  successful: boolean;
+  ledger?: number;
+  feeCharged?: number;
+  error?: string;
+}
+
+/**
+ * Shape of a successfully claimed `claim_winnings` transaction, derived
+ * from the `SentTransaction<bigint>` returned by the generated bindings'
+ * `claim_winnings` client method (see `claim_winnings: (json: string) =>
+ * AssembledTransaction<bigint>` in @tevalabs/xelma-bindings).
+ */
+export interface ClaimResult {
+  state: "on-chain-success";
+  amount: number;
+  txHash?: string;
+}
+
+/** Thrown when a `claim_winnings` response does not have the shape the contract promises. */
+export class InvalidClaimResultError extends Error {
+  constructor(reason: string) {
+    super(`Invalid Soroban claim_winnings result: ${reason}`);
+    this.name = "InvalidClaimResultError";
+  }
+}
+
+/**
+ * Safely parses a sent `claim_winnings` transaction into a {@link ClaimResult}.
+ * `sent.result` is typed as `bigint` by the generated bindings, but since it
+ * ultimately comes from parsed RPC/XDR data we still validate it at runtime
+ * before trusting it, rather than casting past the type system.
+ */
+export function parseClaimResult(
+  sent: contract.SentTransaction<bigint>,
+): ClaimResult {
+  const claimedStroops = sent.result;
+
+  if (typeof claimedStroops !== "bigint") {
+    throw new InvalidClaimResultError(
+      `expected a bigint result, received ${typeof claimedStroops}`,
+    );
+  }
+  if (claimedStroops < BigInt(0)) {
+    throw new InvalidClaimResultError(
+      `claimed amount must not be negative, received ${claimedStroops}`,
+    );
+  }
+
+  return {
+    state: "on-chain-success",
+    amount: stroopsToXlm(claimedStroops),
+    txHash: sent.sendTransactionResponse?.hash,
+  };
 }
 
 /**
@@ -297,12 +355,19 @@ export class SorobanService {
     side: "UP" | "DOWN",
   ): Promise<{ state: string; txHash?: string }> {
     await this.ensureInitialized();
+    const requestId = getRequestId();
     
+    // SAFETY: placeBet is a mutating chain operation.  A timed-out mutation
+    // cannot safely be resent because the first attempt may have reached the
+    // network and succeeded.  Use retries: 1 (single attempt, no automatic
+    // resend).  The prediction reconciliation service handles ambiguous
+    // timeout recovery via on-chain state inspection.
     const result = await this.callWithBreaker("sorobanPlaceBet", () =>
       withTimeout(
         async () => {
         logger.debug(
           `Initiating Soroban placeBet: user=${userAddress}, amount=${amount}, side=${side}`,
+          { requestId, userAddress, amount, side },
         );
 
         // Amount in stroops (1 XLM = 10^7 stroops)
@@ -325,16 +390,18 @@ export class SorobanService {
       {
         timeoutMs: this.CALL_TIMEOUT_MS,
         operationName: 'sorobanPlaceBet',
-        retries: this.MAX_RETRIES,
+        retries: 1,
       }
       )
     );
 
     if (!result.success) {
-      logger.error("Failed to place bet on Soroban after retries", {
+      logger.error("Soroban placeBet failed (single attempt, no auto-retry for mutations)", {
         error: result.error?.message,
         timedOut: result.timedOut,
         durationMs: result.durationMs,
+        requestId,
+        userAddress,
       });
       throw mapSorobanError(result.error?.message);
     }
@@ -342,6 +409,10 @@ export class SorobanService {
     logger.info("Bet placed successfully on Soroban", {
       durationMs: result.durationMs,
       retriesUsed: result.retriesUsed,
+      requestId,
+      txHash: result.data?.txHash,
+      userAddress,
+      correlationId: requestId && result.data?.txHash ? `${requestId}:${result.data.txHash}` : undefined,
     });
 
     return result.data!;
@@ -358,12 +429,14 @@ export class SorobanService {
     predictedPrice: number | string,
   ): Promise<{ state: string; txHash?: string }> {
     await this.ensureInitialized();
+    const requestId = getRequestId();
     
     const result = await this.callWithBreaker("sorobanPlacePrecisionBet", () =>
       withTimeout(
         async () => {
         logger.debug(
           `Initiating Soroban placePrecisionBet: user=${userAddress}, amount=${amount}, predictedPrice=${predictedPrice}`,
+          { requestId, userAddress, amount, predictedPrice },
         );
 
         // Amount in stroops (1 XLM = 10^7 stroops)
@@ -393,6 +466,8 @@ export class SorobanService {
         error: result.error?.message,
         timedOut: result.timedOut,
         durationMs: result.durationMs,
+        requestId,
+        userAddress,
       });
       throw mapSorobanError(result.error?.message);
     }
@@ -400,6 +475,10 @@ export class SorobanService {
     logger.info("Precision bet placed successfully on Soroban", {
       durationMs: result.durationMs,
       retriesUsed: result.retriesUsed,
+      requestId,
+      txHash: result.data?.txHash,
+      userAddress,
+      correlationId: requestId && result.data?.txHash ? `${requestId}:${result.data.txHash}` : undefined,
     });
 
     return result.data!;
@@ -646,32 +725,80 @@ export class SorobanService {
   }
 
   /**
+   * Gets a user's on-chain bet position for a round (read-only query).
+   * Used by the prediction reconciliation service to resolve ambiguous timeouts
+   * where the client doesn't know whether a placeBet call reached the chain.
+   *
+   * Returns null if the user has no position or the contract call fails.
+   */
+  async getUserPosition(
+    userAddress: string,
+    roundId?: string,
+  ): Promise<{ side: 'UP' | 'DOWN'; amount: number } | null> {
+    await this.ready;
+    if (!this.initialized) return null;
+
+    const result = await this.callWithBreaker("sorobanGetUserPosition", () =>
+      withTimeout(
+        async () => {
+          // If the bindings client exposes get_user_position or get_bet, call it.
+          // Fall back to checking contract storage or stats if not directly available.
+          const client = this.client as any;
+          if (typeof client?.get_user_position === 'function') {
+            const pos = await client.get_user_position({
+              user: userAddress,
+              ...(roundId ? { round_id: roundId } : {}),
+            });
+            if (!pos || !pos.result) return null;
+            const res = pos.result;
+            const side: 'UP' | 'DOWN' = res.side?.tag === 'Up' ? 'UP' : 'DOWN';
+            const amount = Number(res.amount) / 10_000_000;
+            return { side, amount };
+          }
+          return null;
+        },
+        {
+          timeoutMs: 10000,
+          operationName: 'sorobanGetUserPosition',
+          retries: 1,
+        }
+      ),
+      null,
+    );
+
+    if (!result.success) {
+      logger.warn("Failed to get user position from Soroban", {
+        userAddress,
+        roundId,
+        error: result.error?.message,
+      });
+      return null;
+    }
+
+    return result.data ?? null;
+  }
+
+  /**
    * Claims pending winnings on the Soroban contract and credits the user's balance.
    * Returns the claimed amount in XLM (converted from stroops) plus optional tx hash.
    *
    * Uses timeout wrapper with retry logic. Signed by the admin keypair (backend relay).
    */
-  async claimWinnings(
-    userAddress: string,
-  ): Promise<{ state: string; amount: number; txHash?: string }> {
+  async claimWinnings(userAddress: string): Promise<ClaimResult> {
     await this.ensureInitialized();
+    const requestId = getRequestId();
 
     const result = await this.callWithBreaker("sorobanClaimWinnings", () =>
       withTimeout(
         async () => {
-          logger.debug(`Initiating Soroban claimWinnings: user=${userAddress}`);
+          logger.debug(`Initiating Soroban claimWinnings: user=${userAddress}`, { requestId, userAddress });
 
           const tx = await this.client!.claim_winnings({ user: userAddress });
           const res = await tx.signAndSend({
             signTransaction: this.signWithAdmin.bind(this),
           });
 
-          const claimedStroops = (res as any)?.result ?? tx.result ?? BigInt(0);
-          return {
-            state: "on-chain-success",
-            amount: stroopsToXlm(claimedStroops),
-            txHash: (res as any).hash,
-          };
+          return parseClaimResult(res);
         },
         {
           timeoutMs: this.CALL_TIMEOUT_MS,
@@ -686,6 +813,8 @@ export class SorobanService {
         error: result.error?.message,
         timedOut: result.timedOut,
         durationMs: result.durationMs,
+        requestId,
+        userAddress,
       });
       throw mapSorobanError(result.error?.message);
     }
@@ -694,7 +823,89 @@ export class SorobanService {
       amount: result.data?.amount,
       durationMs: result.durationMs,
       retriesUsed: result.retriesUsed,
+      requestId,
+      txHash: result.data?.txHash,
+      userAddress,
+      correlationId: requestId && result.data?.txHash ? `${requestId}:${result.data.txHash}` : undefined,
     });
+
+    return result.data!;
+  }
+
+  /**
+   * Checks the status of a transaction by its hash.
+   * Used for reconciliation of stranded SUBMITTED bets.
+   */
+  async getTransactionStatus(txHash: string): Promise<TransactionStatus> {
+    await this.ensureInitialized();
+
+    const result = await this.callWithBreaker("sorobanGetTransactionStatus", () =>
+      withTimeout(
+        async () => {
+          logger.debug(`Checking Soroban transaction status: ${txHash}`);
+
+          // Use the RPC to get transaction details
+          const rpcUrl = config.soroban.rpcUrl;
+          const response = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'getTransaction',
+              params: { hash: txHash },
+            }),
+          });
+
+          const data = await response.json();
+
+          if (data.error) {
+            return {
+              confirmed: false,
+              successful: false,
+              error: data.error.message,
+            };
+          }
+
+          const txResult = data.result;
+          if (!txResult) {
+            return {
+              confirmed: false,
+              successful: false,
+              error: 'Transaction not found',
+            };
+          }
+
+          // Check if transaction is successful (status === "SUCCESS")
+          const status = txResult.status;
+          const successful = status === 'SUCCESS';
+          const confirmed = status !== 'NOT_FOUND' && status !== 'PENDING';
+
+          return {
+            confirmed,
+            successful,
+            ledger: txResult.ledger ? parseInt(txResult.ledger, 10) : undefined,
+            feeCharged: txResult.feeCharged ? parseInt(txResult.feeCharged, 10) : undefined,
+            error: successful ? undefined : txResult.resultXdr ? 'Transaction failed' : undefined,
+          };
+        },
+        {
+          timeoutMs: 10000,
+          operationName: 'sorobanGetTransactionStatus',
+          retries: 1,
+        }
+      ),
+      { confirmed: false, successful: false, error: 'RPC call failed' },
+    );
+
+    if (!result.success) {
+      logger.warn('Failed to get transaction status from Soroban', {
+        txHash,
+        error: result.error?.message,
+        timedOut: result.timedOut,
+      });
+      return { confirmed: false, successful: false, error: result.error?.message ?? 'Unknown error' };
+    }
 
     return result.data!;
   }
